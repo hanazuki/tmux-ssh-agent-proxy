@@ -109,8 +109,6 @@ class Server
             $stderr.puts "Agent added: #{tty} #{auth_sock}"
           end
           unless options[:no_default]
-            p auth_sock
-            p options[:address]
             default_agent = auth_sock
             $stderr.puts "Default agent: #{default_agent}"
           end
