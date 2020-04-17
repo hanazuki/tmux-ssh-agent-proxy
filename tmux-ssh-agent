@@ -76,19 +76,25 @@ class Server
   attr_reader :options
   attr_accessor :agents, :default_agent
 
-  def start
-    File.umask(0077)
-
+  def lock(path)
     lock_file = options[:address].sub_ext('.lock')
     File.open(lock_file, File::WRONLY | File::CREAT) do |f|
       unless f.flock(File::LOCK_EX | File::LOCK_NB)
-        $stderr.puts "Another server instance is running"
-        return
+        fail 'Another server instance is running'
       end
+
       f.truncate(0)
       f.write($$.to_s)
       f.flush
 
+      yield
+    end
+  end
+
+  def start
+    File.umask(0077)
+
+    lock(options[:address].sub_ext('.lock')) do
       begin
         options[:address].unlink
       rescue Errno::ENOENT
