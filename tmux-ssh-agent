@@ -106,6 +106,7 @@ class Server
         if options[:address] != auth_sock
           if tty = ENV['SSH_TTY']
             agents[tty] = auth_sock
+            $stderr.puts "Agent added: #{tty} #{auth_sock}"
           end
           unless options[:no_default]
             p auth_sock
