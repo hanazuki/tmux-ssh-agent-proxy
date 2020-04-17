@@ -139,6 +139,37 @@ class Server
 
   private
 
+  def handle_request(str, sock)
+    type = str.read(1).unpack1('C')
+
+    case type
+    when SSH_EXT_AGENTC_KILL_AGENT
+      sock.send_packet(SSH_AGENT_SUCCESS)
+      sock.flush
+      exit
+    when SSH_EXT_AGENTC_ADD_AGENT
+      tty = str.read(str.read(4).unpack1('N'))
+      auth_sock = str.read(str.read(4).unpack1('N'))
+      auth_sock = nil if auth_sock == ''
+
+      if File.exist?(tty) && (!auth_sock || File.exist?(auth_sock))
+        agents[tty] = auth_sock
+        $stderr.puts "Agent added: #{tty} #{auth_sock}"
+        sock.send_packet(SSH_AGENT_SUCCESS)
+      else
+        sock.send_packet(SSH_AGENT_EXTENSION_FAILURE)
+      end
+    when SSH_EXT_AGENTC_REQUEST_AGENTS
+      payload = {'' => default_agent}.merge(agents).compact.map do |k, v|
+        [k.bytesize, k, v.bytesize, v].pack('Na*Na*')
+      end
+      payload = [payload.size, payload.join].pack('Na*')
+      sock.send_packet(SSH_EXT_AGENT_AGENTS_ANSWER, payload)
+    else
+      sock.send_packet(SSH_AGENT_EXTENSION_FAILURE)
+    end
+  end
+
   def serve_client(sock)
     sock.extend(SSHAgentSocket)
 
@@ -152,44 +183,15 @@ class Server
       break unless type
 
       if type == SSH_AGENTC_EXTENSION
-        str = StringIO.new(contents)
+        packet = StringIO.new(contents)
 
-        if str.read(str.read(4).unpack1('N')) == EXT_ID
-          type = str.read(1).unpack1('C')
-
-          case type
-          when SSH_EXT_AGENTC_KILL_AGENT
-            sock.send_packet(SSH_AGENT_SUCCESS)
-            sock.flush
-            exit
-          when SSH_EXT_AGENTC_ADD_AGENT
-            tty = str.read(str.read(4).unpack1('N'))
-            auth_sock = str.read(str.read(4).unpack1('N'))
-            auth_sock = nil if auth_sock == ''
-
-            if File.exist?(tty) && (!auth_sock || File.exist?(auth_sock))
-              agents[tty] = auth_sock
-              $stderr.puts "Agent added: #{tty} #{auth_sock}"
-              sock.send_packet(SSH_AGENT_SUCCESS)
-            else
-              sock.send_packet(SSH_AGENT_EXTENSION_FAILURE)
-            end
-          when SSH_EXT_AGENTC_REQUEST_AGENTS
-            payload = {'' => default_agent}.merge(agents).compact.map do |k, v|
-              [k.bytesize, k, v.bytesize, v].pack('Na*Na*')
-            end
-            payload = [payload.size, payload.join].pack('Na*')
-            sock.send_packet(SSH_EXT_AGENT_AGENTS_ANSWER, payload)
-          else
-            sock.send_packet(SSH_AGENT_EXTENSION_FAILURE)
-          end
-
+        if packet.read(packet.read(4).unpack1('N')) == EXT_ID
+          handle_request(packet, sock)
           next
         end
       end
 
-      agent = agents.fetch(Tmux.current_client, default_agent)
-      if agent
+      if agent = agents.fetch(Tmux.current_client, default_agent)
         res_type, res_contents = UNIXSocket.open(agent) do |csock|
           csock.extend(SSHAgentSocket)
           csock.request(type, contents)
