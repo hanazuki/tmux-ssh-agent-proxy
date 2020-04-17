@@ -71,6 +71,7 @@ class Server
     @options = options
     @agents = {}
     @default_agent = nil
+    @stopped = false
   end
 
   attr_reader :options
@@ -116,21 +117,15 @@ class Server
 
         Tmux.set_environment('SSH_AUTH_SOCK', options[:address])
 
-        Thread.new do
-          while Tmux.ping
-            sleep 3
-          end
-          exit
-        end
+        workers = ThreadGroup.new
 
-        loop do
-          Thread.new(sock.accept, &method(:serve_client))
-
-          agents.dup.each do |tty, auth_sock|
-            unless File.exist?(tty) && File.exist?(auth_sock)
-              agents.delete(tty)
-              $stderr.puts "Agent purged: #{tty} #{auth_sock}"
-            end
+        until @stopped
+          begin
+            workers.add(Thread.new(sock.accept_nonblock, &method(:serve_client)))
+            clean_agents
+            @stopped = true unless Tmux.ping
+          rescue IO::WaitReadable
+            IO.select([sock], [], [], 3)
           end
         end
       end
@@ -139,6 +134,15 @@ class Server
 
   private
 
+  def clean_agents
+    agents.dup.each do |tty, auth_sock|
+      unless File.exist?(tty) && File.exist?(auth_sock)
+        agents.delete(tty)
+        $stderr.puts "Agent purged: #{tty} #{auth_sock}"
+      end
+    end
+  end
+
   def handle_request(str, sock)
     type = str.read(1).unpack1('C')
 
@@ -146,7 +150,7 @@ class Server
     when SSH_EXT_AGENTC_KILL_AGENT
       sock.send_packet(SSH_AGENT_SUCCESS)
       sock.flush
-      exit
+      @stopped = true
     when SSH_EXT_AGENTC_ADD_AGENT
       tty = str.read(str.read(4).unpack1('N'))
       auth_sock = str.read(str.read(4).unpack1('N'))
@@ -178,7 +182,7 @@ class Server
       return
     end
 
-    loop do
+    until @stopped
       type, contents = sock.read_packet
       break unless type
 
