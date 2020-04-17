@@ -175,7 +175,7 @@ class Server
 
     peer_euid, _ = sock.getpeereid
     if peer_euid != Process.euid
-      fail
+      return
     end
 
     loop do
@@ -203,7 +203,8 @@ class Server
 
       sock.send_packet(res_type, res_contents)
     end
-
+  ensure
+    sock.close
   end
 
 end
