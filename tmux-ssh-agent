@@ -51,16 +51,22 @@ module SSHAgentSocket
 end
 
 class Tmux
+  TMUX_CMD = -'tmux'
+
   def self.ping
-    IO.popen(['tmux', 'display-message', '-p', '1'], &:read).chomp == '1'
+    IO.popen([TMUX_CMD, 'display-message', '-p', '1'], &:read).chomp == '1'
+  end
+
+  def self.socket_path
+    IO.popen([TMUX_CMD, 'display-message', '-p', '#{socket_path}'], &:read).chomp
   end
 
   def self.set_environment(name, value)
-    system('tmux', 'set-environment', '-g', name, value.to_s)
+    system(TMUX_CMD, 'set-environment', '-g', name, value.to_s)
   end
 
   def self.current_client
-    IO.popen(['tmux', 'list-client', '-F', '#{client_activity}:#{client_tty}']) do |f|
+    IO.popen([TMUX_CMD, 'list-client', '-F', '#{client_activity}:#{client_tty}']) do |f|
       f.each_line.map {|l| l.chomp.split(?:, 2) }.max_by {|p| p[0] }[1]
     end
   end
@@ -213,19 +219,9 @@ class Server
 
 end
 
-
-def runtime_dir
-  ENV.fetch('XDG_RUNTIME_DIR') do
-    if `uname -s`.chomp == 'Darwin'
-      break `getconf DARWIN_USER_TEMP_DIR`.strip
-    end
-    fail 'Unable to get runtime directory'
-  end
-end
-
 def parse_options
   options = {
-    address: Pathname(runtime_dir).join('tmux-ssh-agent.sock'),
+    address: Pathname(Tmux.socket_path + '-ssh-agent.sock'),
   }
 
   OptionParser.new {|o|
