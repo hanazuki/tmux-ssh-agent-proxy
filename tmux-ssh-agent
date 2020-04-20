@@ -83,8 +83,39 @@ class Server
   attr_reader :options
   attr_accessor :agents, :default_agent
 
-  def lock(path)
-    lock_file = options[:address].sub_ext('.lock')
+  def start
+    listen(options[:address]) do |sock|
+      auth_sock = Pathname(ENV['SSH_AUTH_SOCK'])
+      if options[:address] != auth_sock
+        if tty = ENV['SSH_TTY']
+          agents[tty] = auth_sock
+          $stderr.puts "Agent added: #{tty} #{auth_sock}"
+        end
+        unless options[:no_default]
+          default_agent = auth_sock
+          $stderr.puts "Default agent: #{default_agent}"
+        end
+      end
+
+      Tmux.set_environment('SSH_AUTH_SOCK', options[:address])
+
+      workers = ThreadGroup.new
+
+      until @stopped
+        begin
+          workers.add(Thread.new(sock.accept_nonblock, &method(:serve_client)))
+          clean_agents
+          @stopped = true unless Tmux.ping
+        rescue IO::WaitReadable
+          IO.select([sock], [], [], 3)
+        end
+      end
+    end
+  end
+
+  private
+
+  def lock(lock_file)
     File.open(lock_file, File::WRONLY | File::CREAT) do |f|
       unless f.flock(File::LOCK_EX | File::LOCK_NB)
         fail 'Another server instance is running'
@@ -98,47 +129,21 @@ class Server
     end
   end
 
-  def start
+  def listen(addr)
     File.umask(0077)
 
-    lock(options[:address].sub_ext('.lock')) do
+    lock(addr.sub_ext('.lock')) do
       begin
-        options[:address].unlink
+        addr.unlink
       rescue Errno::ENOENT
         # nop
       end
 
-      UNIXServer.open(options[:address]) do |sock|
-        auth_sock = Pathname(ENV['SSH_AUTH_SOCK'])
-        if options[:address] != auth_sock
-          if tty = ENV['SSH_TTY']
-            agents[tty] = auth_sock
-            $stderr.puts "Agent added: #{tty} #{auth_sock}"
-          end
-          unless options[:no_default]
-            default_agent = auth_sock
-            $stderr.puts "Default agent: #{default_agent}"
-          end
-        end
-
-        Tmux.set_environment('SSH_AUTH_SOCK', options[:address])
-
-        workers = ThreadGroup.new
-
-        until @stopped
-          begin
-            workers.add(Thread.new(sock.accept_nonblock, &method(:serve_client)))
-            clean_agents
-            @stopped = true unless Tmux.ping
-          rescue IO::WaitReadable
-            IO.select([sock], [], [], 3)
-          end
-        end
+      UNIXServer.open(addr) do |sock|
+        yield sock
       end
     end
   end
-
-  private
 
   def clean_agents
     agents.dup.each do |tty, auth_sock|
