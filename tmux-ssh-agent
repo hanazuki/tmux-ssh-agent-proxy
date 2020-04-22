@@ -110,6 +110,8 @@ class Server
           IO.select([sock], [], [], 3)
         end
       end
+
+      workers.list.each(&:join)
     end
   end
 
