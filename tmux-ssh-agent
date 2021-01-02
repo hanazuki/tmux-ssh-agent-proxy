@@ -109,11 +109,10 @@ class Server
 
       workers = ThreadGroup.new
 
-      until @stopped
+      until @stopped || !Tmux.ping
+        clean_agents
         begin
           workers.add(Thread.new(sock.accept_nonblock, &method(:serve_client)))
-          clean_agents
-          @stopped = true unless Tmux.ping
         rescue IO::WaitReadable
           IO.select([sock], [], [], 3)
         end
