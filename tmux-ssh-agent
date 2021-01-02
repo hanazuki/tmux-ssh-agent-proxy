@@ -73,7 +73,7 @@ class Tmux
 
   def self.current_client
     IO.popen([TMUX_CMD, 'list-client', '-F', '#{client_activity}:#{client_tty}']) do |f|
-      f.each_line.map {|l| l.chomp.split(?:, 2) }.max_by {|p| p[0] }[1]
+      f.each_line.map {|l| l.chomp.split(?:, 2) }.max_by {|p| p[0].to_i }[1]
     end
   end
 end
