@@ -58,7 +58,13 @@ class Tmux
   end
 
   def self.socket_path
-    IO.popen([TMUX_CMD, 'display-message', '-p', '#{socket_path}'], &:read).chomp
+    if tmux = ENV['TMUX']
+      tmux.split(?,, 3)[0]
+    else
+      path = IO.popen([TMUX_CMD, 'display-message', '-p', '#{socket_path}'], &:read).chomp
+      fail 'tmux server not running' unless $?.success?
+      path
+    end
   end
 
   def self.set_environment(name, value)
