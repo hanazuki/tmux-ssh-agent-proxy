@@ -91,15 +91,17 @@ class Server
 
   def start
     listen(options[:address]) do |sock|
-      auth_sock = Pathname(ENV['SSH_AUTH_SOCK'])
-      if options[:address] != auth_sock
-        if tty = ENV['SSH_TTY']
-          agents[tty] = auth_sock
-          $stderr.puts "Agent added: #{tty} #{auth_sock}"
-        end
-        unless options[:no_default]
-          default_agent = auth_sock
-          $stderr.puts "Default agent: #{default_agent}"
+      if ENV.has_key?('SSH_AUTH_SOCK')
+        auth_sock = Pathname(ENV['SSH_AUTH_SOCK'])
+        if options[:address] != auth_sock
+          if tty = ENV['SSH_TTY']
+            agents[tty] = auth_sock
+            $stderr.puts "Agent added: #{tty} #{auth_sock}"
+          end
+          unless options[:no_default]
+            default_agent = auth_sock
+            $stderr.puts "Default agent: #{default_agent}"
+          end
         end
       end
 
