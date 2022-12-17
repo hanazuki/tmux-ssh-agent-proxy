@@ -1,313 +1,290 @@
 #!/usr/bin/env ruby
 =begin
-In .tmux.conf, (without default agent)
-  run -b 'exec tmux-ssh-agent start -n'
-or (with default agent)
-  run -b 'ssh-agent tmux-ssh-agent start'
+In .tmux.conf:
+  run 'tmux-ssh-agent proxy'
 
-In your shell's login profile,
-  if [ -z "$TMUX" ] && [ -n "$SSH_TTY" ]; then
-    tmux-ssh-agent add 2>/dev/null || :
+In your shell's login profile:
+  if [ -z "$TMUX" ] && [ -n "$SSH_AUTH_SOCK" ]; then
+    tmux-ssh-agent register-agent
   fi
 =end
 
-require 'optparse'
+USAGE = <<EOF
+Usage:
+  # Start proxy SSH agent under tmux server
+  #{$0} proxy
+
+  # Register SSH agent for the current TTY
+  #{$0} register-agent [SSH_AUTH_SOCK]
+
+  # Register default SSH agent
+  #{$0} register-default-agent [--override] [SSH_AUTH_SOCK]
+
+  # Lists all the registered SSH agents
+  #{$0} list-agents
+EOF
+
+require 'json'
 require 'pathname'
+require 'securerandom'
 require 'socket'
-require 'stringio'
 
-SSH_AGENT_FAILURE = 5
-SSH_AGENT_SUCCESS = 6
-SSH_AGENTC_EXTENSION = 27
-SSH_AGENT_EXTENSION_FAILURE = 28
-SSH_EXT_AGENTC_KILL_AGENT = 200
-SSH_EXT_AGENTC_ADD_AGENT = 201
-SSH_EXT_AGENTC_REMOVE_AGENT = 202
-SSH_EXT_AGENTC_REQUEST_AGENTS = 203
-SSH_EXT_AGENT_AGENTS_ANSWER = 204
-
-EXT_ID = -'tmux-ssh-agent@exapi.co'
-
-module SSHAgentSocket
-  def read_packet
-    unless len = self.recv(4).unpack1('N')
-      return  # EOF
-    end
-    type = self.recv(1).unpack1('C')
-    contents = len > 1 ? self.recv(len - 1) : ''
-    [type, contents]
-  end
-
-  def send_packet(type, contents = '')
-    len = contents.bytesize
-    packet = [len + 1, type, contents].pack('NCa*')
-    self.send(packet, 0)
-  end
-
-  def request(type, contents = '')
-    send_packet(type, contents)
-    read_packet
-  end
-end
-
-class Tmux
-  TMUX_CMD = -'tmux'
-
-  def self.ping
-    IO.popen([TMUX_CMD, 'display-message', '-p', '1'], &:read).chomp == '1'
-  end
-
-  def self.socket_path
-    if tmux = ENV['TMUX']
-      tmux.split(?,, 3)[0]
-    else
-      path = IO.popen([TMUX_CMD, 'display-message', '-p', '#{socket_path}'], &:read).chomp
-      fail 'tmux server not running' unless $?.success?
-      path
-    end
-  end
-
-  def self.set_environment(name, value)
-    system(TMUX_CMD, 'set-environment', '-g', name, value.to_s)
-  end
-
-  def self.current_client
-    IO.popen([TMUX_CMD, 'list-client', '-F', '#{client_activity}:#{client_tty}']) do |f|
-      f.each_line.map {|l| l.chomp.split(?:, 2) }.max_by {|p| p[0].to_i }[1]
-    end
-  end
-end
-
-class Server
-  def initialize(options)
-    @options = options
-    @agents = {}
-    @default_agent = nil
-    @stopped = false
-  end
-
-  attr_reader :options
-  attr_accessor :agents, :default_agent
-
-  def start
-    listen(options[:address]) do |sock|
-      if ENV.has_key?('SSH_AUTH_SOCK')
-        auth_sock = Pathname(ENV['SSH_AUTH_SOCK'])
-        if options[:address] != auth_sock
-          if tty = ENV['SSH_TTY']
-            agents[tty] = auth_sock
-            $stderr.puts "Agent added: #{tty} #{auth_sock}"
-          end
-          unless options[:no_default]
-            default_agent = auth_sock
-            $stderr.puts "Default agent: #{default_agent}"
-          end
-        end
+module TmuxSSHAgentProxy
+  def self.runtime_dir
+    unless runtime_dir = ENV['RUNTIME_DIRECTORY']
+      if runtime_dir_root = ENV['XDG_RUNTIME_DIR']
+        runtime_dir = Pathname(runtime_dir_root).join('tmux-ssh-agent-proxy')
+      else
+        require 'tmpdir'
+        runtime_dir = Pathname(Dir.tmpdir).join("tmux-ssh-agent-proxy-#{Process.uid}")
       end
 
-      Tmux.set_environment('SSH_AUTH_SOCK', options[:address])
-
-      workers = ThreadGroup.new
-
-      until @stopped || !Tmux.ping
-        clean_agents
-        begin
-          workers.add(Thread.new(sock.accept_nonblock, &method(:serve_client)))
-        rescue IO::WaitReadable
-          IO.select([sock], [], [], 3)
-        end
-      end
-
-      workers.list.each(&:join)
-    end
-  end
-
-  private
-
-  def lock(lock_file)
-    File.open(lock_file, File::WRONLY | File::CREAT) do |f|
-      unless f.flock(File::LOCK_EX | File::LOCK_NB)
-        fail 'Another server instance is running'
-      end
-
-      f.truncate(0)
-      f.write($$.to_s)
-      f.flush
-
-      yield
-    end
-  end
-
-  def listen(addr)
-    File.umask(0077)
-
-    lock(addr.sub_ext('.lock')) do
       begin
-        addr.unlink
-      rescue Errno::ENOENT
-        # nop
+        runtime_dir.mkdir(0700)
+      rescue Errno::EEXIST
       end
+    end
 
-      UNIXServer.open(addr) do |sock|
-        yield sock
+    Pathname(runtime_dir)
+  end
+
+  class Tmux
+    TMUX_CMD = 'tmux'
+
+    def self.ping
+      IO.popen([TMUX_CMD, 'display-message', '-p', '1'], &:read).chomp == '1'
+    end
+
+    def self.set_environment(name, value)
+      system(TMUX_CMD, 'set-environment', '-g', name, value.to_s)
+    end
+
+    def self.current_client
+      IO.popen([TMUX_CMD, 'list-client', '-F', '#{client_activity}:#{client_tty}']) do |f|
+        f.each_line.map {|l| l.chomp.split(?:, 2) }.max_by {|p| p[0].to_i }[1]
       end
     end
   end
 
-  def clean_agents
-    agents.dup.each do |tty, auth_sock|
-      unless File.exist?(tty) && File.exist?(auth_sock)
-        agents.delete(tty)
-        $stderr.puts "Agent purged: #{tty} #{auth_sock}"
+  module SSHAgentProtocol
+    SSH_AGENT_FAILURE = 5
+    SSH_AGENT_SUCCESS = 6
+  end
+
+  module SSHAgentSocket
+    FAILURE = [SSHAgentProtocol::SSH_AGENT_FAILURE].pack('C')
+
+    def recv_packet
+      unless len = self.recv(4).unpack1('N')
+        return  # EOF
+      end
+      payload = self.recv(len)
+    end
+
+    def send_packet(payload)
+      self.send([payload.bytesize, payload].pack('Na*'), 0)
+    end
+
+    def request(payload)
+      send_packet(payload)
+      recv_packet
+    end
+
+    def handle_request(&handler)
+      if payload = recv_packet
+        response = handler.call(payload)
+        send_packet(response)
+        true
       end
     end
   end
 
-  def handle_request(str, sock)
-    type = str.read(1).unpack1('C')
+  class StateFile
+    def initialize(path)
+      @path = path
+    end
 
-    case type
-    when SSH_EXT_AGENTC_KILL_AGENT
-      sock.send_packet(SSH_AGENT_SUCCESS)
-      sock.flush
-      @stopped = true
-    when SSH_EXT_AGENTC_ADD_AGENT
-      tty = str.read(str.read(4).unpack1('N'))
-      auth_sock = str.read(str.read(4).unpack1('N'))
-      auth_sock = nil if auth_sock == ''
+    def lock(&)
+      File.open(@path, File::RDWR | File::CREAT) do |f|
+        f.flock(File::LOCK_EX)
 
-      if File.exist?(tty) && (!auth_sock || File.exist?(auth_sock))
-        agents[tty] = auth_sock
-        $stderr.puts "Agent added: #{tty} #{auth_sock}"
-        sock.send_packet(SSH_AGENT_SUCCESS)
-      else
-        sock.send_packet(SSH_AGENT_EXTENSION_FAILURE)
+        state = cleanup(
+          begin
+            s = JSON.parse(f.read)
+            s.is_a?(Hash) ? s : {}
+          rescue JSON::ParserError
+            {}
+          end
+        )
+
+        yield state
+      ensure
+        f.truncate(0)
+        f.rewind
+        JSON.dump(state, f)
       end
-    when SSH_EXT_AGENTC_REQUEST_AGENTS
-      payload = {'' => default_agent}.merge(agents).compact.map do |k, v|
-        [k.bytesize, k, v.bytesize, v].pack('Na*Na*')
-      end
-      payload = [payload.size, payload.join].pack('Na*')
-      sock.send_packet(SSH_EXT_AGENT_AGENTS_ANSWER, payload)
-    else
-      sock.send_packet(SSH_AGENT_EXTENSION_FAILURE)
+    end
+
+    private
+
+    def cleanup(state)
+      {
+        'agents' => state.fetch('agents', {}).filter {|_, agent| File.exist?(agent) }.to_h,
+        'default_agent'=> begin
+                            if default_agent = state['default_agent'] and File.exist?(default_agent)
+                              default_agent
+                            end
+                          end,
+      }
     end
   end
 
-  def serve_client(sock)
-    sock.extend(SSHAgentSocket)
-
-    peer_euid, _ = sock.getpeereid
-    if peer_euid != Process.euid
-      return
+  class ProxyAgent
+    def initialize
+      @state_file = StateFile.new(TmuxSSHAgentProxy.runtime_dir / 'state')
+      @workers = ThreadGroup.new
     end
 
-    until @stopped
-      type, contents = sock.read_packet
-      break unless type
+    def run(ready: nil)
+      path = TmuxSSHAgentProxy.runtime_dir / SecureRandom.hex(16)
+      listen(path) do |socket|
+        Tmux.set_environment('SSH_AUTH_SOCK', path)
 
-      if type == SSH_AGENTC_EXTENSION
-        packet = StringIO.new(contents)
+        ready&.call
 
-        if packet.read(packet.read(4).unpack1('N')) == EXT_ID
-          handle_request(packet, sock)
-          next
+        while Tmux.ping
+          begin
+            @workers.add(Thread.new(socket.accept_nonblock, &method(:serve_client)))
+          rescue IO::WaitReadable
+            IO.select([socket], [], [], 3)
+          end
+        end
+
+        @workers.list.each(&:join)
+      end
+    end
+
+    private
+
+    def serve_client(downstream_socket)
+      downstream_socket.extend(SSHAgentSocket)
+
+      agent = @state_file.lock do |state|
+        if tty = Tmux.current_client
+          state.dig('agents', tty)
+        else
+          state['default_agent']
+        end
+      end or return
+
+      UNIXSocket.open(agent) do |upstream_socket|
+        upstream_socket.extend(SSHAgentSocket)
+
+        loop do
+          downstream_socket.handle_request do |payload|
+            upstream_socket.request(payload) || SSHAgentSocket::FAILURE
+          end or break
         end
       end
+    ensure
+      downstream_socket.close
+    end
 
-      if agent = agents.fetch(Tmux.current_client, default_agent)
-        res_type, res_contents = UNIXSocket.open(agent) do |csock|
-          csock.extend(SSHAgentSocket)
-          csock.request(type, contents)
+    def listen(path, &block)
+      UNIXServer.open(path, &block)
+    ensure
+      path.unlink rescue nil
+    end
+  end
+
+  class Control
+    def initialize
+      @state_file = StateFile.new(TmuxSSHAgentProxy.runtime_dir / 'state')
+    end
+
+    def register_agent(tty, agent)
+      @state_file.lock do |state|
+        state['agents'][tty] = agent
+      end
+    end
+
+    def register_default_agent(tty, agent, override: false)
+      @state_file.lock do |state|
+        if override
+          state['default_agent'] = agent
+        else
+          state['default_agent'] ||= agent
+        end
+      end
+    end
+
+    def state
+      @state_file.lock {|state| state }
+    end
+  end
+
+  class CLI
+    def run(args)
+      case args.shift
+      when 'proxy'
+        fail 'Not running under tmux server' unless ENV.key?('TMUX')
+        if args.delete('--no-daemon')
+          ProxyAgent.new.run
+        else
+          r, w = IO.pipe
+
+          fork do
+            r.close
+
+            Process.daemon
+            ProxyAgent.new.run(ready: ->() { w.write('ok'); w.close })
+          end
+
+          w.close
+          ok = r.read(2) == 'ok'
+          r.close
+          exit(ok ? 0 : 1)
+        end
+      when 'register-agent'
+        Control.new.register_agent(
+          tty,
+          args[0] || ssh_auth_sock || fail('No SSH_AUTH_SOCK specified')
+        )
+      when 'register-default-agent'
+        override = args.delete('--override')
+        Control.new.register_default_agent(
+          tty,
+          args[0] || ssh_auth_sock || fail('No SSH_AUTH_SOCK specified'),
+          override:,
+        )
+      when 'list', 'list-agents'
+        state = Control.new.state
+        if default_agent = state['default_agent']
+          puts "  default: #{default_agent}"
+        end
+        state['agents'].each do |client, agent|
+          puts "#{client == tty ? '* ' : '  '}#{client}: #{agent}"
         end
       else
-        res_type = SSH_AGENT_FAILURE
-        res_contents = ''
+        $stderr.puts USAGE
+        exit 1
       end
-
-      sock.send_packet(res_type, res_contents)
-    end
-  ensure
-    sock.close
-  end
-
-end
-
-def parse_options
-  options = {
-    address: Pathname(Tmux.socket_path + '-ssh-agent.sock'),
-  }
-
-  OptionParser.new {|o|
-    o.on('-a PATH', '--bind-address', '--address') {|v| options[:address] = Pathname(v) }
-    o.on('-n', '--no-default-agent') {|v| options[:no_default] = true }
-  }.parse!(ARGV)
-
-  options[:no_default] = ENV.has_key?('SSH_CONNECTION') if options[:no_default].nil?
-
-  options
-end
-
-def main
-  options = parse_options
-  action = ARGV.shift or fail 'No action specified'
-
-  case action
-  when 'start'
-    fail 'Not running under tmux server' unless ENV.include?('TMUX')
-    Server.new(options).start
-
-  when 'stop'
-    msg = [EXT_ID.bytesize, EXT_ID, SSH_EXT_AGENTC_KILL_AGENT].pack('Na*C')
-
-    UNIXSocket.open(options[:address]) do |sock|
-      sock.extend(SSHAgentSocket)
-
-      type, * = sock.request(SSH_AGENTC_EXTENSION, msg)
-      if type != SSH_AGENT_SUCCESS
-        fail 'Failed to stop agent'
-      end
+    rescue => e
+      $stderr.puts e.message
+      exit 1
     end
 
-  when 'add'
-    tty = ENV['SSH_TTY'] || `tty`.chomp
-    auth_sock = ENV['SSH_AUTH_SOCK'] || ARGV.shift || fail('No SSH_AUTH_SOCK specified')
+    private
 
-    if Pathname(auth_sock) == options[:address]
-      fail 'Loop!'
+    def tty
+      @tty ||= ENV['SSH_TTY'] || `tty`.chomp
     end
 
-    msg = [EXT_ID.bytesize, EXT_ID, SSH_EXT_AGENTC_ADD_AGENT, tty.bytesize, tty, auth_sock.bytesize, auth_sock].pack('Na*CNa*Na*')
-
-    UNIXSocket.open(options[:address]) do |sock|
-      sock.extend(SSHAgentSocket)
-
-      type, _ = sock.request(SSH_AGENTC_EXTENSION, msg)
-      if type != SSH_AGENT_SUCCESS
-        fail 'Failed to add agent'
-      end
+    def ssh_auth_sock
+      @ssh_auth_sock ||= ENV['SSH_AUTH_SOCK']
     end
-  when 'list'
-    msg = [EXT_ID.bytesize, EXT_ID, SSH_EXT_AGENTC_REQUEST_AGENTS].pack('Na*C')
-
-    UNIXSocket.open(options[:address]) do |sock|
-      sock.extend(SSHAgentSocket)
-
-      type, contents = sock.request(SSH_AGENTC_EXTENSION, msg)
-      if type != SSH_EXT_AGENT_AGENTS_ANSWER
-        fail 'Failed to list agent'
-      end
-
-      str = StringIO.new(contents)
-      str.read(4).unpack1('N').times do
-        tty = str.read(str.read(4).unpack1('N'))
-        auth_sock = str.read(str.read(4).unpack1('N'))
-        puts "#{tty.empty? ? 'default' : tty}: #{auth_sock}"
-      end
-    end
-  else
-    fail "Unknown action `#{action}'"
   end
 end
 
-main
+Thread.report_on_exception = true
+TmuxSSHAgentProxy::CLI.new.run(ARGV)
